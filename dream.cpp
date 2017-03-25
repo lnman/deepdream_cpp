@@ -4,9 +4,10 @@
 // why?? see: http://stackoverflow.com/questions/42634179/caffenet-reshape
 // But in python implementation that is not needed. why??
 // I looked into _caffe.cpp and pycaffe.py, but found nothing
-// I only had cpu to test and it takes way longer(3X+) than numpy code
-// so need to be optimized using both opencv and caffe functions
+// I tested using both openblas and mkl and numpy functions are quite faster (mkl) than opencv
 // any suggestion is welcome at momen_bhuiyan@yahoo.com
+// edit summary: I previously thought there was a bottleneck in forward-backward due to time computation using clock() as it calculated clock cycle used by all processor
+
 
 #include <caffe/caffe.hpp>
 #include <opencv2/core/core.hpp>
@@ -60,7 +61,6 @@ string type2str(int type) {
   r += (chans+'0');
   return r;
 }
-
 
 // wrap layer pointers
 void WrapInputLayer(std::vector<cv::Mat>* input_channels) {
@@ -175,8 +175,7 @@ void objective(){
 
 	clock_t begint = clock();
 	float *res = new float[guide_features_area*net_area];
-	// this is still 10X slower than numpy. ??
-	// todo: improve performance
+	// this is ~10X slower if compiled with openblas as numpy mkl dot is way fast
 	caffe_cpu_gemm<float>(CblasNoTrans,CblasNoTrans,guide_features_area,net_area,net_chan,1,guide_features_t,net_->blob_by_name(end)->mutable_cpu_data(),0,res);
 	cv::Mat rr = cv::Mat(cv::Size(net_area,guide_features_area), CV_32FC1, res);
 	clock_t endt = clock();
@@ -215,35 +214,32 @@ void clamp(cv::Mat& mat, cv::Point3f lowerBound, cv::Point3f upperBound) {
 }
 
 
-// todo: find bottleneck
 // todo: change rand to caffe rng
 void make_step(cv::Size octave_base_size,float step_size=1.5, int jitter=32,bool clip=true){
 	cv::Mat src = blob_to_cvimg_mat(octave_base_size,net_->input_blobs()[0]->mutable_cpu_data());
 	int ox = (rand()%(jitter*2+1))-jitter;
 	int oy = (rand()%(jitter*2+1))-jitter;
 	cv::Mat res = cv::Mat::zeros(src.size(), src.type());
-	// roll image
 	shiftRows(res,src,ox);
 	shiftCol(src,res,oy);
 
-	// probably because copyTo calls m.create(this->size(), this->type());
-	// todo: find out
+	// cv::merge creates new array
 	cvimg_mat_to_blob(src,&input_channels);
-	// clock_t begint = clock();
+	clock_t begint = clock();
 	net_->ForwardFromTo(0,index_of_end);
-	// clock_t endt = clock();
-	// double time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
-	// printf("timespent in forward : %lf \n",time_spent );
-	// begint = endt;
+	clock_t endt = clock();
+	double time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
+	printf("timespent in forward : %lf \n",time_spent );
+	begint = endt;
 	objective();
-	// endt = clock();
-	// time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
-	// printf("timespent in objective : %lf \n",time_spent );
-	// begint = endt;
+	endt = clock();
+	time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
+	printf("timespent in objective : %lf \n",time_spent );
+	begint = endt;
 	net_->BackwardFromTo(index_of_end,0);
-	// endt = clock();
-	// time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
-	// printf("timespent in backward : %lf \n",time_spent );
+	endt = clock();
+	time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
+	printf("timespent in backward : %lf \n",time_spent );
 	
 	// update image
 	float asum_mean =  caffe_cpu_asum<float>(octave_base_size.area() * num_channels_, net_->input_blobs()[0]->cpu_diff())/(octave_base_size.area() * num_channels_);
@@ -251,6 +247,7 @@ void make_step(cv::Size octave_base_size,float step_size=1.5, int jitter=32,bool
 	caffe_axpy<float>(octave_base_size.area() * num_channels_, stepp, net_->input_blobs()[0]->cpu_diff(),net_->input_blobs()[0]->mutable_cpu_data());
 	src = blob_to_cvimg_mat(octave_base_size,net_->input_blobs()[0]->mutable_cpu_data());
 	
+	// reverse roll
 	shiftRows(res,src,-ox);
 	shiftCol(src,res,-oy);
 
@@ -293,7 +290,7 @@ void dream(int times=4,float scale=1.4,int iter_n=10){
 		string filename = "octave"+SSTR(octave)+".jpg";
 		string filename2 = "display"+SSTR(octave)+".jpg";
 		string filename3 = "result"+SSTR(octave)+".jpg";
-		clock_t begin = clock();
+		clock_t begint = clock();
 		for (int i = 0; i < iter_n; ++i)
 		{
 			make_step(octave_base.size());
@@ -301,8 +298,8 @@ void dream(int times=4,float scale=1.4,int iter_n=10){
 			// cv::Mat image =blob_to_cvimg_mat(octave_base.size(),net_->input_blobs()[0]->mutable_cpu_data());
 			// display_image(image);
 		}
-		clock_t end = clock();
-		double time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
+		clock_t endt = clock();
+		double time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
 		printf("timespent on iteration %d : %lf \n",octave,time_spent );
 		detail = blob_to_cvimg_mat(octave_base.size(),net_->input_blobs()[0]->mutable_cpu_data())-octave_base;
 		cv::Mat image =blob_to_cvimg_mat(octave_base.size(),net_->input_blobs()[0]->mutable_cpu_data());
