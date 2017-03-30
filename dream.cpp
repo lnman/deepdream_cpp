@@ -1,12 +1,12 @@
 // this is a cpp translation of deepdream python code
 // some functions are copied from caffe cpp classification and stackoverflow
-// the last 2 layers have to be removed from googlenet prototxt to run
-// why?? see: http://stackoverflow.com/questions/42634179/caffenet-reshape
-// But in python implementation that is not needed. why??
-// I looked into _caffe.cpp and pycaffe.py, but found nothing
 // I tested using both openblas and mkl and numpy functions are quite faster (mkl) than opencv
 // any suggestion is welcome at momen_bhuiyan@yahoo.com
-// edit summary: I previously thought there was a bottleneck in forward-backward due to time computation using clock() as it calculated clock cycle used by all processor
+// 1st edit summary: I previously thought there was a bottleneck in forward-backward due to time computation using clock() as it calculated clock cycle used by all processor
+// 2nd edit summary: added some gpu code and tested gpu - 3x+ than mkl(but not cudnn my cuda capability < 2.1) and had to change net to local variable as in case of global cudafreehost memory error occurrs
+// removed net_reshape as it reshaped the whole network and required to remove innerproduct layers. for details see http://stackoverflow.com/questions/42634179/caffenet-reshape
+// also it is not needed as forward calls reshape already
+// todo: reduce data copy between cpu-gpu
 
 
 #include <caffe/caffe.hpp>
@@ -34,10 +34,11 @@ const string end = "inception_3b/output";
 const string end2 = "inception_4c/output";
 
 // vars
-shared_ptr<Net<float> > net_;
+
 cv::Mat img,guide;
 float* guide_features;
-float* guide_features_t;
+// float* guide_features_t;
+
 int guide_features_area;
 int index_of_end;
 std::vector<cv::Mat> input_channels;
@@ -63,7 +64,7 @@ string type2str(int type) {
 }
 
 // wrap layer pointers
-void WrapInputLayer(std::vector<cv::Mat>* input_channels) {
+void WrapInputLayer(shared_ptr<Net<float> > net_,std::vector<cv::Mat>* input_channels) {
 	input_channels->clear();
 	Blob<float>* input_layer = net_->input_blobs()[0];
 	int width = input_layer->width();
@@ -77,7 +78,7 @@ void WrapInputLayer(std::vector<cv::Mat>* input_channels) {
 }
 
 // opencv image pointers to wrapped layer pointers
-void cvimg_mat_to_blob(const cv::Mat& img, std::vector<cv::Mat>* input_channels) {
+void cvimg_mat_to_blob(shared_ptr<Net<float> > net_,const cv::Mat& img, std::vector<cv::Mat>* input_channels) {
 	cv::split(img, *input_channels);
 	CHECK(reinterpret_cast<float*>(input_channels->at(0).data) == net_->input_blobs()[0]->cpu_data())<< "Input channels are not wrapping the input layer of the network.";
 }
@@ -161,23 +162,37 @@ void shiftRows(cv::Mat& out, cv::Mat in, int numpos){
 }
 
 
-void objective_L2(){
-	memcpy(net_->blob_by_name(end).get()[0].mutable_cpu_diff(),net_->blob_by_name(end).get()[0].mutable_cpu_data(),net_->blob_by_name(end)->channels()*net_->blob_by_name(end)->height()*net_->blob_by_name(end)->width()*sizeof(float));
+void objective_L2(shared_ptr<Net<float> > net_){
+	if (Caffe::mode() == Caffe::GPU){
+		caffe_copy<float>(net_->blob_by_name(end)->channels()*net_->blob_by_name(end)->height()*net_->blob_by_name(end)->width(),net_->blob_by_name(end).get()[0].mutable_gpu_data(),net_->blob_by_name(end).get()[0].mutable_gpu_diff());
+	}
+	else{
+		caffe_copy<float>(net_->blob_by_name(end)->channels()*net_->blob_by_name(end)->height()*net_->blob_by_name(end)->width(),net_->blob_by_name(end).get()[0].mutable_cpu_data(),net_->blob_by_name(end).get()[0].mutable_cpu_diff());
+	}
+	
 }
 
 
 //objective for guided feature
-void objective(){
+void objective(shared_ptr<Net<float> > net_,Blob<float>* guide_features_t){
 	int net_area = net_->blob_by_name(end)->width()*net_->blob_by_name(end)->height();
 	int net_chan = net_->blob_by_name(end)->channels();
 	std::vector<int> idxs;
 	cv::Point p2;
 
 	clock_t begint = clock();
-	float *res = new float[guide_features_area*net_area];
+	Blob<float> res;
+	cv::Mat rr;
+	res.Reshape(1,1,1,guide_features_area*net_area);
+	// float *res = new float[guide_features_area*net_area];
 	// this is ~10X slower if compiled with openblas as numpy mkl dot is way fast
-	caffe_cpu_gemm<float>(CblasNoTrans,CblasNoTrans,guide_features_area,net_area,net_chan,1,guide_features_t,net_->blob_by_name(end)->mutable_cpu_data(),0,res);
-	cv::Mat rr = cv::Mat(cv::Size(net_area,guide_features_area), CV_32FC1, res);
+	if (Caffe::mode() == Caffe::GPU){
+		caffe_gpu_gemm<float>(CblasNoTrans,CblasNoTrans,guide_features_area,net_area,net_chan,1,guide_features_t->mutable_gpu_data(),net_->blob_by_name(end)->mutable_gpu_data(),0,res.mutable_gpu_data());
+	}else{
+		caffe_cpu_gemm<float>(CblasNoTrans,CblasNoTrans,guide_features_area,net_area,net_chan,1,guide_features_t->mutable_cpu_data(),net_->blob_by_name(end)->mutable_cpu_data(),0,res.mutable_cpu_data());
+	}
+	rr = cv::Mat(cv::Size(net_area,guide_features_area), CV_32FC1, res.mutable_cpu_data());
+	
 	clock_t endt = clock();
 	double time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
 	printf("timespent in cross : %lf \n",time_spent );
@@ -199,7 +214,7 @@ void objective(){
 		data += guide_features_area;
 		diff += net_area;
 	}
-	delete[] res;
+	// delete[] res;
 }
 
 
@@ -215,7 +230,7 @@ void clamp(cv::Mat& mat, cv::Point3f lowerBound, cv::Point3f upperBound) {
 
 
 // todo: change rand to caffe rng
-void make_step(cv::Size octave_base_size,float step_size=1.5, int jitter=32,bool clip=true){
+void make_step(shared_ptr<Net<float> > net_,Blob<float>* guide_features_t,cv::Size octave_base_size,float step_size=1.5, int jitter=32,bool clip=true){
 	cv::Mat src = blob_to_cvimg_mat(octave_base_size,net_->input_blobs()[0]->mutable_cpu_data());
 	int ox = (rand()%(jitter*2+1))-jitter;
 	int oy = (rand()%(jitter*2+1))-jitter;
@@ -224,14 +239,14 @@ void make_step(cv::Size octave_base_size,float step_size=1.5, int jitter=32,bool
 	shiftCol(src,res,oy);
 
 	// cv::merge creates new array
-	cvimg_mat_to_blob(src,&input_channels);
+	cvimg_mat_to_blob(net_,src,&input_channels);
 	clock_t begint = clock();
 	net_->ForwardFromTo(0,index_of_end);
 	clock_t endt = clock();
 	double time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
 	printf("timespent in forward : %lf \n",time_spent );
 	begint = endt;
-	objective();
+	objective(net_,guide_features_t);
 	endt = clock();
 	time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
 	printf("timespent in objective : %lf \n",time_spent );
@@ -240,11 +255,17 @@ void make_step(cv::Size octave_base_size,float step_size=1.5, int jitter=32,bool
 	endt = clock();
 	time_spent = (double)(endt - begint) / CLOCKS_PER_SEC;
 	printf("timespent in backward : %lf \n",time_spent );
-	
-	// update image
-	float asum_mean =  caffe_cpu_asum<float>(octave_base_size.area() * num_channels_, net_->input_blobs()[0]->cpu_diff())/(octave_base_size.area() * num_channels_);
+	float asum_mean =  net_->input_blobs()[0]->asum_diff()/(octave_base_size.area() * num_channels_);
+	printf("asum_mean : %f\n",asum_mean );
 	float stepp = step_size/asum_mean;
-	caffe_axpy<float>(octave_base_size.area() * num_channels_, stepp, net_->input_blobs()[0]->cpu_diff(),net_->input_blobs()[0]->mutable_cpu_data());
+
+	// update image
+	if (Caffe::mode() == Caffe::GPU){
+		caffe_gpu_axpy<float>(octave_base_size.area() * num_channels_, stepp, net_->input_blobs()[0]->gpu_diff(),net_->input_blobs()[0]->mutable_gpu_data());
+	}
+	else{
+		caffe_axpy<float>(octave_base_size.area() * num_channels_, stepp, net_->input_blobs()[0]->cpu_diff(),net_->input_blobs()[0]->mutable_cpu_data());
+	}
 	src = blob_to_cvimg_mat(octave_base_size,net_->input_blobs()[0]->mutable_cpu_data());
 	
 	// reverse roll
@@ -254,12 +275,12 @@ void make_step(cv::Size octave_base_size,float step_size=1.5, int jitter=32,bool
 	if(clip){
 		clamp(src,cv::Point3f(-104.0, -116.0, -122.0),cv::Point3f(255-104.0, 255-116.0, 255-122.0));
 	}
-	cvimg_mat_to_blob(src,&input_channels);
+	cvimg_mat_to_blob(net_,src,&input_channels);
 }
 
 
 
-void dream(int times=4,float scale=1.4,int iter_n=10){
+void dream(shared_ptr<Net<float> > net_,Blob<float>* guide_features_t,int times=4,float scale=1.4,int iter_n=10){
 	// create resized images
 	std::vector<cv::Mat> octaves;
 	octaves.push_back(img);
@@ -283,9 +304,9 @@ void dream(int times=4,float scale=1.4,int iter_n=10){
 		cv::Mat ttt = octave_base+detail;
 		Blob<float>* input_layer = net_->input_blobs()[0];
   		input_layer->Reshape(1, num_channels_,ttt.rows, ttt.cols);
-		net_->Reshape();
-		WrapInputLayer(&input_channels);
-		cvimg_mat_to_blob(ttt, &input_channels);
+		// net_->Reshape();
+		WrapInputLayer(net_,&input_channels);
+		cvimg_mat_to_blob(net_,ttt, &input_channels);
 
 		string filename = "octave"+SSTR(octave)+".jpg";
 		string filename2 = "display"+SSTR(octave)+".jpg";
@@ -293,7 +314,7 @@ void dream(int times=4,float scale=1.4,int iter_n=10){
 		clock_t begint = clock();
 		for (int i = 0; i < iter_n; ++i)
 		{
-			make_step(octave_base.size());
+			make_step(net_,guide_features_t,octave_base.size());
 			
 			// cv::Mat image =blob_to_cvimg_mat(octave_base.size(),net_->input_blobs()[0]->mutable_cpu_data());
 			// display_image(image);
@@ -318,13 +339,15 @@ int main(int argc, char const *argv[])
 	              << " sky.jpg flower.jpg" << std::endl;
 	    return 1;
 	}
+	Caffe::set_mode(Caffe::GPU);
 	srand(time(NULL));
 	// argv
 	string model_file   = argv[1];
 	string trained_file = argv[2];
 	string sky = argv[3];
 	string flower = argv[4];
-	Caffe::set_mode(Caffe::CPU);
+	shared_ptr<Net<float> > net_;
+	Blob<float> guide_features_t;
 		
 	// load model and param
 	net_.reset(new Net<float>(model_file, TEST));
@@ -349,11 +372,11 @@ int main(int argc, char const *argv[])
   	// reshape net
   	Blob<float>* input_layer = net_->input_blobs()[0];
   	input_layer->Reshape(1, num_channels_,guide.rows, guide.cols);
-	net_->Reshape();
+	// net_->Reshape();
 
 	// forward the guide
-	WrapInputLayer(&input_channels);
-	cvimg_mat_to_blob(guide, &input_channels);
+	WrapInputLayer(net_,&input_channels);
+	cvimg_mat_to_blob(net_,guide, &input_channels);
 	net_->ForwardFromTo(0,index_of_end);
 	
 	//copy to guide_features
@@ -365,8 +388,9 @@ int main(int argc, char const *argv[])
 	memcpy(guide_features,net_->blob_by_name(end)->mutable_cpu_data(),guide_size);
 
 	// transpose
-	guide_features_t = new float[guide_chan*guide_features_area];
-	float *tmp = guide_features_t;
+	// guide_features_t = new float[guide_chan*guide_features_area];
+	guide_features_t.Reshape(1,1,1,guide_chan*guide_features_area);
+	float *tmp = guide_features_t.mutable_cpu_data();
 	for (int j = 0; j < guide_features_area; ++j)
 	{
 		for (int i = 0; i < guide_chan; ++i)
@@ -374,12 +398,11 @@ int main(int argc, char const *argv[])
 			tmp[0] = guide_features[i*guide_features_area+j];
 			tmp++;
 		}
-		
 	}
 	
 	// dream
-	dream();
+	dream(net_,&guide_features_t);
 	delete[] guide_features;
-	delete[] guide_features_t;
+	// delete[] guide_features_t;
 	return 0;
 }
